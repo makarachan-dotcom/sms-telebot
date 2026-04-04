@@ -52,6 +52,7 @@ from port_manifest import build_port_manifest
 
 # Import SMS module
 from sms_service import get_sms_service, COUNTRY_CODES, SMSResult
+from carrier_detector import detect_carrier, validate_phone_number, mask_phone_number
 
 # Enable logging
 logging.basicConfig(
@@ -96,10 +97,37 @@ STYLES = {
     "receive": "📥",
     "history": "📜",
     "settings": "🔧",
+    # Additional style keys
+    "chat": "💬",
+    "tools": "🛠️",
+    "help": "❓",
+    "info": "ℹ️",
+    "error": "❌",
+    "warning": "⚠️",
+    "check": "✅",
+    "timer": "⏱️",
+    "carrier": "📡",
+    "confirm": "🔒",
+    "cancel": "🚫",
+    "sending": "📤",
+    "delivered": "✅",
+    "pending": "⏳",
+    "retry": "🔄",
+    "lock": "🔐",
+    "key": "🔑",
 }
 
 # Conversation states
 CHAT_MODE, EXECUTING_COMMAND = range(2)
+
+# Interactive SMS conversation states
+(
+    SMS_COUNTRY_SELECTION,
+    SMS_PHONE_NUMBER_INPUT,
+    SMS_WAITING_COUNTDOWN,
+    SMS_MESSAGE_INPUT,
+    SMS_CONFIRMATION,
+) = range(10, 15)
 
 
 @dataclass
@@ -227,6 +255,7 @@ def get_help_message() -> str:
 
 {STYLES['diamond']} <b>SMS Commands {STYLES['sms']}</b>
 /sms - SMS service menu
+/sms_send_interactive - Interactive SMS send (guided)
 /sms_send &lt;phone&gt; &lt;msg&gt; - Send SMS
 /sms_contact &lt;name&gt; &lt;msg&gt; - Send to contact
 /sms_contacts - List contacts
@@ -808,7 +837,8 @@ async def sms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 {STYLES['bullet']} Default Country: {stats['default_country']['flag']} {stats['default_country']['name']}
 
 <b>SMS Commands:</b>
-{STYLES['bullet']} /sms_send &lt;phone&gt; &lt;message&gt; - Send SMS
+{STYLES['bullet']} /sms_send_interactive - Guided SMS wizard 🧙
+{STYLES['bullet']} /sms_send &lt;phone&gt; &lt;message&gt; - Quick send SMS
 {STYLES['bullet']} /sms_contact &lt;name&gt; &lt;message&gt; - Send to contact
 {STYLES['bullet']} /sms_contacts - List your contacts
 {STYLES['bullet']} /sms_add &lt;name&gt; &lt;phone&gt; - Add contact
@@ -1183,6 +1213,334 @@ async def sms_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(response, parse_mode=ParseMode.HTML)
 
 
+# ==================== INTERACTIVE SMS FLOW ====================
+
+def _build_country_keyboard() -> InlineKeyboardMarkup:
+    """Build inline keyboard with country selection buttons."""
+    buttons = []
+    country_items = list(COUNTRY_CODES.items())
+    # Two countries per row
+    for i in range(0, len(country_items), 2):
+        row = []
+        for code, info in country_items[i:i + 2]:
+            label = f"{info['flag']} {info['name']} ({info['code']})"
+            row.append(InlineKeyboardButton(label, callback_data=f"sms_country:{code}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(f"{STYLES['cancel']} Cancel", callback_data="sms_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def sms_send_interactive_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle /sms_send_interactive - Entry point for guided SMS wizard."""
+    user = update.effective_user
+
+    # Reset any previous interactive SMS state
+    context.user_data.pop("sms_country", None)
+    context.user_data.pop("sms_phone", None)
+    context.user_data.pop("sms_carrier", None)
+    context.user_data.pop("sms_message", None)
+
+    intro = (
+        f"{STYLES['sms']} <b>Interactive SMS Wizard</b>\n\n"
+        f"{STYLES['bullet']} Step 1 of 4: Select your destination country\n\n"
+        f"{STYLES['info']} Tap the country flag below to continue:"
+    )
+    await update.message.reply_text(
+        intro,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_build_country_keyboard(),
+    )
+    return SMS_COUNTRY_SELECTION
+
+
+async def sms_country_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle country selection from inline keyboard callback."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "sms_cancel":
+        await query.edit_message_text(
+            f"{STYLES['cancel']} <b>SMS Wizard cancelled.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    # Parse country code from callback data
+    _, country_code = query.data.split(":", 1)
+    country = COUNTRY_CODES.get(country_code)
+    if not country:
+        await query.edit_message_text(
+            f"{STYLES['error']} Invalid country selection. Please try again.",
+            parse_mode=ParseMode.HTML,
+        )
+        return SMS_COUNTRY_SELECTION
+
+    context.user_data["sms_country"] = country_code
+
+    prompt = (
+        f"{country['flag']} <b>Country selected:</b> {country['name']} ({country['code']})\n\n"
+        f"{STYLES['phone']} <b>Step 2 of 4: Enter the recipient's phone number</b>\n\n"
+        f"{STYLES['info']} Enter the number <b>without</b> the leading 0 or country code.\n"
+        f"Example: for <code>012 345 678</code> enter <code>12345678</code>\n\n"
+        f"Type /cancel to abort."
+    )
+    await query.edit_message_text(prompt, parse_mode=ParseMode.HTML)
+    return SMS_PHONE_NUMBER_INPUT
+
+
+async def sms_phone_number_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle phone number input: validate, detect carrier, start countdown."""
+    user = update.effective_user
+    phone_input = update.message.text.strip()
+    country_code = context.user_data.get("sms_country", "kh")
+    country = COUNTRY_CODES.get(country_code, COUNTRY_CODES["kh"])
+
+    # Validate phone number
+    is_valid, cleaned_phone, error_msg = validate_phone_number(phone_input, country_code)
+    if not is_valid:
+        await update.message.reply_text(
+            f"{STYLES['error']} <b>Invalid phone number</b>\n\n"
+            f"{error_msg}\n\n"
+            f"{STYLES['info']} Please enter the number without leading 0 or country code.\n"
+            f"Example: <code>96123456</code> (for Cambodia)\n\n"
+            f"Type /cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+        return SMS_PHONE_NUMBER_INPUT
+
+    # Full E.164 number
+    full_phone = f"{country['code']}{cleaned_phone}"
+    context.user_data["sms_phone"] = full_phone
+
+    # Detect carrier
+    carrier_name, carrier_emoji = detect_carrier(cleaned_phone, country_code)
+    context.user_data["sms_carrier"] = f"{carrier_emoji} {carrier_name}"
+
+    # Acknowledgement with carrier info
+    ack_msg = (
+        f"{STYLES['check']} <b>Phone number accepted!</b>\n\n"
+        f"{STYLES['phone']} <b>Number:</b> <code>{mask_phone_number(full_phone)}</code>\n"
+        f"{STYLES['carrier']} <b>Carrier:</b> {carrier_emoji} {carrier_name}\n"
+        f"{country['flag']} <b>Country:</b> {country['name']}\n\n"
+        f"{STYLES['timer']} <b>Please wait 10 seconds before entering your message…</b>"
+    )
+    status_msg = await update.message.reply_text(ack_msg, parse_mode=ParseMode.HTML)
+
+    # 10-second countdown: shows 10, 9, 8, … 1, then proceeds
+    for remaining in range(10, 0, -1):
+        await asyncio.sleep(1)
+        try:
+            await status_msg.edit_text(
+                ack_msg + f"\n\n⏳ <b>{remaining}s remaining…</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass  # Message may have been deleted; continue countdown
+
+    # Countdown done
+    try:
+        await status_msg.edit_text(
+            f"{STYLES['check']} <b>Ready!</b>\n\n"
+            f"{STYLES['phone']} <b>Number:</b> <code>{mask_phone_number(full_phone)}</code>\n"
+            f"{STYLES['carrier']} <b>Carrier:</b> {carrier_emoji} {carrier_name}\n\n"
+            f"{STYLES['message']} <b>Step 3 of 4: Enter your message</b>\n\n"
+            f"Type the SMS text you want to send, then press Send.\n"
+            f"Type /cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await update.message.reply_text(
+            f"{STYLES['message']} <b>Step 3 of 4: Enter your message</b>\n\n"
+            f"Type the SMS text you want to send, then press Send.\n"
+            f"Type /cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    return SMS_MESSAGE_INPUT
+
+
+async def sms_message_input_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle message text input and show confirmation screen."""
+    message_text = update.message.text.strip()
+    if not message_text:
+        await update.message.reply_text(
+            f"{STYLES['error']} Message cannot be empty. Please enter your message.",
+            parse_mode=ParseMode.HTML,
+        )
+        return SMS_MESSAGE_INPUT
+
+    context.user_data["sms_message"] = message_text
+
+    full_phone = context.user_data.get("sms_phone", "")
+    carrier_display = context.user_data.get("sms_carrier", "❓ Unknown")
+    country_code = context.user_data.get("sms_country", "kh")
+    country = COUNTRY_CODES.get(country_code, COUNTRY_CODES["kh"])
+
+    preview = message_text[:200] + ("…" if len(message_text) > 200 else "")
+
+    confirmation_msg = (
+        f"{STYLES['confirm']} <b>Step 4 of 4: Confirm and Send</b>\n\n"
+        f"{STYLES['divider']}\n"
+        f"{STYLES['phone']} <b>Recipient:</b> <code>{mask_phone_number(full_phone)}</code>\n"
+        f"{country['flag']} <b>Country:</b> {country['name']}\n"
+        f"{STYLES['carrier']} <b>Carrier:</b> {carrier_display}\n"
+        f"{STYLES['divider']}\n"
+        f"{STYLES['message']} <b>Message Preview:</b>\n"
+        f"<blockquote>{preview}</blockquote>\n"
+        f"{STYLES['divider']}\n\n"
+        f"Tap <b>✅ Send</b> to confirm or <b>🚫 Cancel</b> to abort."
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Send SMS", callback_data="sms_confirm_send"),
+            InlineKeyboardButton("🚫 Cancel", callback_data="sms_confirm_cancel"),
+        ]
+    ]
+    await update.message.reply_text(
+        confirmation_msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return SMS_CONFIRMATION
+
+
+async def sms_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle confirmation or cancellation of the interactive SMS send."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    if query.data == "sms_confirm_cancel":
+        await query.edit_message_text(
+            f"{STYLES['cancel']} <b>SMS cancelled.</b>\n\nNo message was sent.",
+            parse_mode=ParseMode.HTML,
+        )
+        _clear_sms_state(context)
+        return ConversationHandler.END
+
+    # Retrieve stored data
+    full_phone = context.user_data.get("sms_phone", "")
+    message_text = context.user_data.get("sms_message", "")
+    carrier_display = context.user_data.get("sms_carrier", "❓ Unknown")
+
+    if not full_phone or not message_text:
+        await query.edit_message_text(
+            f"{STYLES['error']} Session data lost. Please start over with /sms_send_interactive.",
+            parse_mode=ParseMode.HTML,
+        )
+        _clear_sms_state(context)
+        return ConversationHandler.END
+
+    # Show "sending" status
+    sending_msg = (
+        f"{STYLES['sending']} <b>Sending SMS…</b>\n\n"
+        f"{STYLES['phone']} <b>To:</b> <code>{mask_phone_number(full_phone)}</code>\n"
+        f"{STYLES['carrier']} <b>Carrier:</b> {carrier_display}\n\n"
+        f"⏳ <i>Please wait…</i>"
+    )
+    await query.edit_message_text(sending_msg, parse_mode=ParseMode.HTML)
+
+    # Send the SMS
+    sms_service = get_sms_service()
+    result = sms_service.send_sms(user.id, full_phone, message_text)
+
+    # Build real-time status message
+    if result.success:
+        status_msg = (
+            f"{STYLES['check']} <b>SMS Sent Successfully!</b>\n\n"
+            f"{STYLES['phone']} <b>To:</b> <code>{mask_phone_number(full_phone)}</code>\n"
+            f"{STYLES['carrier']} <b>Carrier:</b> {carrier_display}\n"
+            f"{STYLES['message']} <b>Message:</b>\n"
+            f"<blockquote>{message_text[:100]}{'…' if len(message_text) > 100 else ''}</blockquote>\n\n"
+            f"{STYLES['chip']} <b>Text ID:</b> <code>{result.text_id}</code>\n"
+            f"{STYLES['diamond']} <b>Quota Remaining:</b> {result.quota_remaining}\n\n"
+            f"{STYLES['pending']} <b>Status:</b> SENT → checking delivery…"
+        )
+        await query.edit_message_text(status_msg, parse_mode=ParseMode.HTML)
+
+        # Poll delivery status a few times
+        if result.text_id:
+            await _poll_delivery_status(query, result, full_phone, carrier_display, message_text, sms_service)
+    else:
+        error_detail = result.error or "Unknown error"
+        fail_msg = (
+            f"{STYLES['error']} <b>SMS Failed to Send</b>\n\n"
+            f"{STYLES['phone']} <b>To:</b> <code>{mask_phone_number(full_phone)}</code>\n"
+            f"{STYLES['carrier']} <b>Carrier:</b> {carrier_display}\n\n"
+            f"{STYLES['error']} <b>Error:</b> {error_detail}\n\n"
+            f"{STYLES['retry']} <b>Suggestions:</b>\n"
+            f"▸ Check your API key with /sms_setkey\n"
+            f"▸ Verify quota with /sms_stats\n"
+            f"▸ Confirm the phone number format\n"
+            f"▸ Try again with /sms_send_interactive"
+        )
+        await query.edit_message_text(fail_msg, parse_mode=ParseMode.HTML)
+
+    _clear_sms_state(context)
+    return ConversationHandler.END
+
+
+async def _poll_delivery_status(
+    query,
+    result: SMSResult,
+    full_phone: str,
+    carrier_display: str,
+    message_text: str,
+    sms_service,
+    polls: int = 3,
+    interval: float = 3.0,
+) -> None:
+    """Poll delivery status and update message in real-time."""
+    status_icons = {
+        "DELIVERED": (STYLES["delivered"], "DELIVERED ✅"),
+        "SENT": (STYLES["sms"], "SENT 📱"),
+        "SENDING": (STYLES["sending"], "SENDING ⏳"),
+        "FAILED": (STYLES["error"], "FAILED ❌"),
+        "PENDING": (STYLES["pending"], "PENDING ⏳"),
+        "UNKNOWN": ("❓", "UNKNOWN ❓"),
+    }
+
+    for _ in range(polls):
+        await asyncio.sleep(interval)
+        status_data = sms_service.check_status(result.text_id)
+        delivery_status = status_data.get("status", "UNKNOWN").upper()
+        icon, label = status_icons.get(delivery_status, ("❓", delivery_status))
+
+        updated_msg = (
+            f"{STYLES['check']} <b>SMS Status Update</b>\n\n"
+            f"{STYLES['phone']} <b>To:</b> <code>{mask_phone_number(full_phone)}</code>\n"
+            f"{STYLES['carrier']} <b>Carrier:</b> {carrier_display}\n"
+            f"{STYLES['message']} <b>Message:</b>\n"
+            f"<blockquote>{message_text[:100]}{'…' if len(message_text) > 100 else ''}</blockquote>\n\n"
+            f"{STYLES['chip']} <b>Text ID:</b> <code>{result.text_id}</code>\n"
+            f"{icon} <b>Status:</b> {label}"
+        )
+        try:
+            await query.edit_message_text(updated_msg, parse_mode=ParseMode.HTML)
+        except Exception:
+            break  # Message no longer editable
+
+        if delivery_status in ("DELIVERED", "FAILED"):
+            break
+
+
+def _clear_sms_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear interactive SMS wizard state from user_data."""
+    for key in ("sms_country", "sms_phone", "sms_carrier", "sms_message"):
+        context.user_data.pop(key, None)
+
+
 # Callback query handlers
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button callbacks"""
@@ -1266,7 +1624,7 @@ def main() -> None:
     
     # Create application
     application = Application.builder().token(token).build()
-    
+
     # Add conversation handler for chat mode
     chat_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("chat", chat_command)],
@@ -1275,12 +1633,35 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
+
+    # Interactive SMS wizard conversation handler
+    sms_interactive_handler = ConversationHandler(
+        entry_points=[CommandHandler("sms_send_interactive", sms_send_interactive_command)],
+        states={
+            SMS_COUNTRY_SELECTION: [
+                CallbackQueryHandler(sms_country_callback, pattern=r"^sms_country:"),
+                CallbackQueryHandler(sms_country_callback, pattern=r"^sms_cancel$"),
+            ],
+            SMS_PHONE_NUMBER_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sms_phone_number_handler),
+            ],
+            SMS_MESSAGE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sms_message_input_handler),
+            ],
+            SMS_CONFIRMATION: [
+                CallbackQueryHandler(sms_confirm_callback, pattern=r"^sms_confirm_"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_command)],
+        allow_reentry=True,
+    )
     
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(chat_conv_handler)
+    application.add_handler(sms_interactive_handler)
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("session", session_command))
     application.add_handler(CommandHandler("stats", stats_command))
