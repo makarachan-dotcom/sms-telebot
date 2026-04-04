@@ -1332,8 +1332,8 @@ async def sms_phone_number_handler(
     )
     status_msg = await update.message.reply_text(ack_msg, parse_mode=ParseMode.HTML)
 
-    # 10-second countdown
-    for remaining in range(9, 0, -1):
+    # 10-second countdown: shows 10, 9, 8, … 1, then proceeds
+    for remaining in range(10, 0, -1):
         await asyncio.sleep(1)
         try:
             await status_msg.edit_text(
@@ -1342,8 +1342,6 @@ async def sms_phone_number_handler(
             )
         except Exception:
             pass  # Message may have been deleted; continue countdown
-
-    await asyncio.sleep(1)
 
     # Countdown done
     try:

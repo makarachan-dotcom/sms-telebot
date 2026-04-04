@@ -25,7 +25,6 @@ CARRIER_PREFIXES: Dict[str, Dict[str, Tuple[str, str]]] = {
         "096": ("Smart", "🔵"),
         "098": ("Smart", "🔵"),
         # Metfone (Vietnam Telecom)
-        "017": ("Metfone", "🟢"),
         "031": ("Metfone", "🟢"),
         "060": ("Metfone", "🟢"),
         "066": ("Metfone", "🟢"),
