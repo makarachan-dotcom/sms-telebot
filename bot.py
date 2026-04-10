@@ -50,14 +50,21 @@ from models import UsageSummary
 from execution_registry import build_execution_registry
 from port_manifest import build_port_manifest
 
-# Import SMS module
+# Import SMS module (TextBelt legacy)
 from sms_service import get_sms_service, COUNTRY_CODES, SMSResult
 
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+# Import Infobip SMS, database, and config modules
+import config as bot_config
+from config import (
+    ADMIN_USER_IDS as INFOBIP_ADMIN_IDS,
+    MAX_SMS_PER_DAY,
+    DB_PATH,
 )
+import database as db
+from infobip import InfobipClient, SMSSendResult, format_cambodian_number, get_infobip_client
+
+# Configure detailed logging (file + console) via config module
+bot_config.configure_logging()
 logger = logging.getLogger(__name__)
 
 # Bot Configuration
@@ -100,6 +107,8 @@ STYLES = {
 
 # Conversation states
 CHAT_MODE, EXECUTING_COMMAND = range(2)
+# Infobip SMS conversation states (continue numbering to avoid collisions)
+SENDSMS_PHONE, SENDSMS_MESSAGE = range(2, 4)
 
 
 @dataclass
@@ -1183,9 +1192,474 @@ async def sms_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(response, parse_mode=ParseMode.HTML)
 
 
+
+# ==================== INFOBIP SMS HANDLERS ====================
+# Interactive, step-by-step SMS sending via Infobip with rate limiting,
+# ban checks, and database logging.  Supports Cambodian (+855) numbers only.
+
+
+def _is_admin(user_id: int) -> bool:
+    """Return True if *user_id* has admin privileges.
+
+    Checks both INFOBIP_ADMIN_IDS (from config.py / .env) and the existing
+    ADMIN_IDS list that may be configured in the legacy bot config.
+    """
+    return user_id in INFOBIP_ADMIN_IDS
+
+
+def _ensure_user(user_id: int, username: Optional[str], first_name: Optional[str]) -> None:
+    """Register or update the user row in the SQLite database."""
+    try:
+        db.register_user(DB_PATH, user_id, username, first_name)
+    except Exception as exc:
+        logger.warning("_ensure_user failed for %d: %s", user_id, exc)
+
+
+# ── /sendsms – ConversationHandler entry point ────────────────────────────────
+
+async def sendsms_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handle the /sendsms command.
+
+    Registers the user, checks for a ban, shows an inline keyboard menu, and
+    asks for the recipient's phone number to begin the interactive SMS flow.
+    """
+    user = update.effective_user
+    _ensure_user(user.id, user.username, user.first_name)
+
+    # Ban check
+    if db.is_banned(DB_PATH, user.id):
+        await update.message.reply_text(
+            "🚫 <b>Access Denied</b>\n\n"
+            "Your account has been banned from using the SMS service.\n"
+            "Contact an administrator if you believe this is a mistake.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    # Rate-limit check
+    used, _ = db.get_daily_usage(DB_PATH, user.id)
+    keyboard = [
+        [
+            InlineKeyboardButton("📤 Send SMS", callback_data="ibsms_begin"),
+            InlineKeyboardButton("❌ Cancel",   callback_data="ibsms_cancel"),
+        ]
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"📱 <b>Infobip SMS Service</b>\n\n"
+        f"Cambodia 🇰🇭 (+855) numbers only.\n\n"
+        f"📊 Today: <b>{used}/{MAX_SMS_PER_DAY}</b> messages sent.\n\n"
+        f"Press <b>Send SMS</b> to continue, or Cancel to abort.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+    return SENDSMS_PHONE
+
+
+async def sendsms_phone_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handle the inline-keyboard 'Send SMS' button press and prompt for a
+    Cambodian phone number.
+
+    Triggered when the user clicks the 📤 Send SMS inline button.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ibsms_cancel":
+        await query.edit_message_text("❌ SMS sending cancelled.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "📞 <b>Step 1 / 2 — Enter recipient phone number</b>\n\n"
+        "Cambodian numbers only.  Accepted formats:\n"
+        "  • <code>012345678</code>  (with leading 0)\n"
+        "  • <code>12345678</code>   (without leading 0)\n"
+        "  • <code>+85512345678</code>  (full E.164)\n\n"
+        "Type /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+    return SENDSMS_PHONE
+
+
+async def sendsms_receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Validate the phone number entered by the user and advance to the message
+    step.
+
+    On validation failure, the user is prompted to re-enter.
+    """
+    raw_phone: str = update.message.text.strip()
+    try:
+        formatted = format_cambodian_number(raw_phone)
+    except ValueError as exc:
+        await update.message.reply_text(
+            f"⚠️ <b>Invalid phone number</b>\n\n{exc}\n\n"
+            "Please try again (or /cancel to abort).",
+            parse_mode=ParseMode.HTML,
+        )
+        return SENDSMS_PHONE  # stay in the same state; let user retry
+
+    # Store for next step
+    context.user_data["sendsms_to"] = formatted
+
+    await update.message.reply_text(
+        f"✅ Recipient: <code>{formatted}</code>\n\n"
+        "✍️ <b>Step 2 / 2 — Type your message</b>\n\n"
+        "Maximum 160 characters for a single-part SMS.\n"
+        "Type /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+    return SENDSMS_MESSAGE
+
+
+async def sendsms_receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Receive the SMS text from the user, perform rate-limit and ban checks,
+    then show a confirmation inline keyboard before sending.
+    """
+    user = update.effective_user
+    sms_text: str = update.message.text.strip()
+    recipient: str = context.user_data.get("sendsms_to", "")
+
+    if not recipient:
+        await update.message.reply_text(
+            "⚠️ Session expired.  Please run /sendsms again.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    if not sms_text:
+        await update.message.reply_text(
+            "⚠️ Message cannot be empty.  Try again or /cancel.",
+            parse_mode=ParseMode.HTML,
+        )
+        return SENDSMS_MESSAGE
+
+    # Re-check ban (in case admin acted mid-conversation)
+    if db.is_banned(DB_PATH, user.id):
+        await update.message.reply_text("🚫 Your account is banned.")
+        return ConversationHandler.END
+
+    # Rate-limit check
+    if not _is_admin(user.id):
+        allowed, count = db.check_and_increment_quota(DB_PATH, user.id, MAX_SMS_PER_DAY)
+        if not allowed:
+            await update.message.reply_text(
+                f"⛔ <b>Daily limit reached</b>\n\n"
+                f"You have already sent <b>{count}</b> SMS today "
+                f"(limit: {MAX_SMS_PER_DAY}).\n"
+                "Please try again tomorrow.",
+                parse_mode=ParseMode.HTML,
+            )
+            return ConversationHandler.END
+        # Store the count used for display
+        context.user_data["sendsms_quota_count"] = count
+    else:
+        # Admins are not rate-limited; use -1 as a sentinel value
+        context.user_data["sendsms_quota_count"] = -1
+
+    # Store message text
+    context.user_data["sendsms_text"] = sms_text
+
+    preview = sms_text[:120] + ("…" if len(sms_text) > 120 else "")
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirm & Send", callback_data="ibsms_confirm"),
+            InlineKeyboardButton("❌ Cancel",          callback_data="ibsms_cancel_final"),
+        ]
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"📋 <b>Confirm your SMS</b>\n\n"
+        f"📞 <b>To:</b> <code>{recipient}</code>\n"
+        f"💬 <b>Message:</b>\n<blockquote>{preview}</blockquote>\n\n"
+        f"Press <b>Confirm &amp; Send</b> to dispatch or <b>Cancel</b> to abort.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+    return ConversationHandler.END  # Outcome handled in button_callback
+
+
+async def sendsms_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /cancel inside the send-SMS conversation."""
+    await update.message.reply_text(
+        "❌ SMS sending cancelled.",
+        parse_mode=ParseMode.HTML,
+    )
+    context.user_data.pop("sendsms_to",   None)
+    context.user_data.pop("sendsms_text", None)
+    return ConversationHandler.END
+
+
+# ── Inline-keyboard confirm/cancel callbacks for the Infobip flow ────────────
+
+async def _ibsms_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Actually send the SMS via Infobip after the user clicks 'Confirm & Send'.
+
+    Logs the result (success or failure) to the SQLite database and reports
+    back to the user with a clear success / error message.
+    """
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+
+    recipient: str = context.user_data.pop("sendsms_to",   "")
+    sms_text:  str = context.user_data.pop("sendsms_text", "")
+
+    if not recipient or not sms_text:
+        await query.edit_message_text("⚠️ Session data lost.  Please run /sendsms again.")
+        return
+
+    await query.edit_message_text("⏳ Sending via Infobip…")
+
+    try:
+        client: InfobipClient = get_infobip_client()
+        result: SMSSendResult = client.send_sms(to=recipient, text=sms_text)
+    except ValueError as exc:
+        # Infobip not configured
+        await query.edit_message_text(
+            f"⚠️ <b>Configuration error</b>\n\n{exc}\n\n"
+            "Ask an administrator to set INFOBIP_API_KEY and INFOBIP_BASE_URL.",
+            parse_mode=ParseMode.HTML,
+        )
+        db.log_sms(
+            DB_PATH, user.id, recipient, sms_text,
+            status="failed", error=str(exc),
+        )
+        return
+
+    # Persist audit log
+    db.log_sms(
+        DB_PATH,
+        sender_id=user.id,
+        recipient=recipient,
+        message=sms_text,
+        status="sent" if result.success else "failed",
+        message_id=result.message_id,
+        error=result.error,
+    )
+
+    if result.success:
+        await query.edit_message_text(
+            f"✅ <b>SMS Sent Successfully!</b>\n\n"
+            f"📞 <b>To:</b> <code>{recipient}</code>\n"
+            f"🆔 <b>Message ID:</b> <code>{result.message_id}</code>\n"
+            f"📊 <b>Status:</b> {result.status_name}",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info(
+            "SMS sent: user=%d to=%s id=%s",
+            user.id, recipient, result.message_id,
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ <b>SMS Failed</b>\n\n"
+            f"📞 <b>To:</b> <code>{recipient}</code>\n"
+            f"⚠️ <b>Error:</b> {result.error}",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.warning(
+            "SMS failed: user=%d to=%s error=%s",
+            user.id, recipient, result.error,
+        )
+
+
+# ── Admin commands ────────────────────────────────────────────────────────────
+
+async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /users (admin only).
+
+    Displays a paginated list of all registered users with their ban status and
+    total SMS sent count.
+    """
+    user = update.effective_user
+    _ensure_user(user.id, user.username, user.first_name)
+
+    if not _is_admin(user.id):
+        await update.message.reply_text("🚫 Admin access required.")
+        return
+
+    users = db.get_all_users(DB_PATH)
+    if not users:
+        await update.message.reply_text("ℹ️ No users registered yet.")
+        return
+
+    lines = [f"👥 <b>Registered Users ({len(users)})</b>\n"]
+    for u in users[:30]:  # cap at 30 to avoid message size limits
+        ban_icon = "🚫" if u["is_banned"] else "✅"
+        uname = f"@{u['username']}" if u["username"] else u["first_name"] or "—"
+        lines.append(
+            f"{ban_icon} <code>{u['telegram_id']}</code> {uname} "
+            f"| SMS: {u['total_sent']}"
+        )
+
+    if len(users) > 30:
+        lines.append(f"\n<i>… and {len(users) - 30} more.</i>")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def admin_ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /ban <user_id> (admin only).
+
+    Bans the specified Telegram user from using the SMS service.
+    """
+    user = update.effective_user
+    _ensure_user(user.id, user.username, user.first_name)
+
+    if not _is_admin(user.id):
+        await update.message.reply_text("🚫 Admin access required.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ <b>Usage:</b> <code>/ban &lt;user_id&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ User ID must be a number.")
+        return
+
+    updated = db.ban_user(DB_PATH, target_id)
+    if updated:
+        await update.message.reply_text(
+            f"🚫 User <code>{target_id}</code> has been <b>banned</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info("Admin %d banned user %d", user.id, target_id)
+    else:
+        await update.message.reply_text(
+            f"⚠️ User <code>{target_id}</code> not found in the database.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def admin_unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /unban <user_id> (admin only).
+
+    Lifts the ban on the specified Telegram user.
+    """
+    user = update.effective_user
+    _ensure_user(user.id, user.username, user.first_name)
+
+    if not _is_admin(user.id):
+        await update.message.reply_text("🚫 Admin access required.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ <b>Usage:</b> <code>/unban &lt;user_id&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ User ID must be a number.")
+        return
+
+    updated = db.unban_user(DB_PATH, target_id)
+    if updated:
+        await update.message.reply_text(
+            f"✅ User <code>{target_id}</code> has been <b>unbanned</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info("Admin %d unbanned user %d", user.id, target_id)
+    else:
+        await update.message.reply_text(
+            f"⚠️ User <code>{target_id}</code> not found in the database.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /adminstats (admin only).
+
+    Shows global platform statistics: user count, ban count, total SMS sent.
+    """
+    user = update.effective_user
+    _ensure_user(user.id, user.username, user.first_name)
+
+    if not _is_admin(user.id):
+        await update.message.reply_text("🚫 Admin access required.")
+        return
+
+    stats = db.get_global_stats(DB_PATH)
+    await update.message.reply_text(
+        f"📊 <b>Global Statistics</b>\n\n"
+        f"👥 Total users:    <b>{stats['total_users']}</b>\n"
+        f"🚫 Banned users:   <b>{stats['banned_users']}</b>\n"
+        f"📤 Total SMS sent: <b>{stats['total_sms_sent']}</b>\n"
+        f"📅 Today's SMS:    <b>{stats['today_sms_sent']}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def ibsms_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /ibsmshistory.
+
+    Shows the last 10 SMS messages the user has sent via the Infobip flow.
+    """
+    user = update.effective_user
+    _ensure_user(user.id, user.username, user.first_name)
+
+    history = db.get_user_sms_history(DB_PATH, user.id, limit=10)
+    if not history:
+        await update.message.reply_text(
+            "ℹ️ You have not sent any SMS via the Infobip service yet.\n"
+            "Use /sendsms to get started.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [f"📜 <b>Your last {len(history)} SMS (Infobip)</b>\n"]
+    for entry in history:
+        icon = "✅" if entry["status"] == "sent" else "❌"
+        lines.append(
+            f"{icon} <code>{entry['recipient']}</code> — "
+            f"{entry['sent_at'][:16]}\n"
+            f"   💬 {entry['message'][:60]}{'…' if len(entry['message']) > 60 else ''}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # Callback query handlers
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle button callbacks"""
+    """Handle button callbacks from all inline keyboards in the bot.
+
+    Dispatches on ``callback_query.data``:
+
+    * ``start_chat``        – legacy chat mode shortcut
+    * ``show_commands``     – show sampled command list
+    * ``show_tools``        – show sampled tool list
+    * ``show_help``         – show help text
+    * ``ibsms_begin``       – begin the Infobip phone-entry step
+    * ``ibsms_confirm``     – confirm and dispatch the composed SMS
+    * ``ibsms_cancel``      – cancel from the menu screen
+    * ``ibsms_cancel_final``– cancel from the confirmation screen
+    """
     query = update.callback_query
     await query.answer()
     
@@ -1213,6 +1687,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=get_help_message(),
             parse_mode=ParseMode.HTML
         )
+    # ── Infobip SMS flow ──
+    elif query.data == "ibsms_begin":
+        await sendsms_phone_prompt(update, context)
+    elif query.data == "ibsms_confirm":
+        await _ibsms_dispatch(update, context)
+    elif query.data in ("ibsms_cancel", "ibsms_cancel_final"):
+        context.user_data.pop("sendsms_to",   None)
+        context.user_data.pop("sendsms_text", None)
+        await query.edit_message_text("❌ SMS sending cancelled.")
 
 
 # Error handler
@@ -1233,8 +1716,12 @@ Please try again or contact support.
 
 def main() -> None:
     """Start the bot"""
+    # ── Initialise Infobip database ──────────────────────────────────────────
+    bot_config.ensure_directories()
+    db.init_db(DB_PATH)
+
     # Get token from environment
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or bot_config.TELEGRAM_TOKEN
     
     if not token:
         print("""
@@ -1275,12 +1762,33 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
+
+    # ── Infobip SMS ConversationHandler ─────────────────────────────────────
+    # Flow: /sendsms → (inline button) → phone number → message text → confirm
+    sendsms_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("sendsms", sendsms_start)],
+        states={
+            SENDSMS_PHONE: [
+                # Inline-keyboard button to begin phone entry
+                CallbackQueryHandler(sendsms_phone_prompt, pattern="^ibsms_begin$"),
+                CallbackQueryHandler(sendsms_cancel,       pattern="^ibsms_cancel$"),
+                # User types a phone number
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sendsms_receive_phone),
+            ],
+            SENDSMS_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sendsms_receive_message),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", sendsms_cancel)],
+        allow_reentry=True,
+    )
     
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(chat_conv_handler)
+    application.add_handler(sendsms_conv_handler)
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("session", session_command))
     application.add_handler(CommandHandler("stats", stats_command))
@@ -1294,7 +1802,7 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     
-    # SMS handlers
+    # Legacy TextBelt SMS handlers
     application.add_handler(CommandHandler("sms", sms_command))
     application.add_handler(CommandHandler("sms_send", sms_send_command))
     application.add_handler(CommandHandler("sms_contact", sms_contact_command))
@@ -1306,6 +1814,15 @@ def main() -> None:
     application.add_handler(CommandHandler("sms_setkey", sms_setkey_command))
     application.add_handler(CommandHandler("sms_setcountry", sms_setcountry_command))
     application.add_handler(CommandHandler("sms_status", sms_status_command))
+
+    # ── Infobip SMS commands ─────────────────────────────────────────────────
+    application.add_handler(CommandHandler("ibsmshistory", ibsms_history_command))
+
+    # ── Admin commands ───────────────────────────────────────────────────────
+    application.add_handler(CommandHandler("users",      admin_users_command))
+    application.add_handler(CommandHandler("ban",        admin_ban_command))
+    application.add_handler(CommandHandler("unban",      admin_unban_command))
+    application.add_handler(CommandHandler("adminstats", admin_stats_command))
     
     application.add_handler(CallbackQueryHandler(button_callback))
     
@@ -1315,6 +1832,7 @@ def main() -> None:
     # Start the bot
     print("✅ Bot is running! Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 
 if __name__ == "__main__":
