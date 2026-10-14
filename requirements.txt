@@ -1,5 +1,5 @@
 # AI STAND WY2.5 - Telegram Bot Requirements
-# Created by Kimi K2.5
+# Created by Chan Makara
 
 # Core Telegram Bot
 python-telegram-bot>=20.7

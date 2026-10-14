@@ -241,4 +241,4 @@ application.add_handler(CommandHandler("mynew", mynew_command))
 
 ---
 
-**Architecture by Kimi K2.5** | Based on Claude Code Python Port
+**Architecture by Chan Makara** | Based on Claude Code Python Port

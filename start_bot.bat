@@ -2,7 +2,7 @@
 chcp 65001 >nul
 
 :: AI STAND WY2.5 - Startup Script for Windows
-:: Created by Kimi K2.5
+:: Created by Chan Makara
 
 echo ╔══════════════════════════════════════════════════════════════╗
 echo ║                                                              ║

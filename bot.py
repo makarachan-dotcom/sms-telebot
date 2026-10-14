@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 🤖 AI STAND WY2.5 - Advanced Telegram Bot
-Based on Claude Code Architecture Port
-Created with love by Kimi K2.5 for the community
+Created by Chan Makara
 
 Features:
 - Natural language processing with command/tool routing
@@ -63,7 +62,7 @@ logger = logging.getLogger(__name__)
 # Bot Configuration
 BOT_NAME = "AI STAND WY2.5"
 BOT_VERSION = "2.5.0"
-BOT_CREATOR = "Kimi K2.5"
+BOT_CREATOR = "Chan Makara"
 
 # Cyberpunk styling
 STYLES = {
@@ -190,7 +189,6 @@ def get_welcome_message() -> str:
 
 <i>"The future of AI assistance is here"</i>
 
-{STYLES['brain']} Powered by Claude Code Architecture
 {STYLES['chip']} Engineered by {BOT_CREATOR}
 {STYLES['rocket']} Version {BOT_VERSION}
 
@@ -307,7 +305,6 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 <b>Version:</b> {BOT_VERSION}
 <b>Creator:</b> {BOT_CREATOR}
-<b>Architecture:</b> Claude Code Python Port
 
 {STYLES['divider']}
 
@@ -321,7 +318,6 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 {STYLES['divider']}
 
 Built with {STYLES['fire']} Python + python-telegram-bot
-Powered by the Claude Code architecture
 
 {STYLES['footer']}
 """

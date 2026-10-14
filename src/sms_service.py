@@ -1,7 +1,7 @@
 """
 AI STAND WY2.5 - SMS Service Module
 TextBelt API Integration with Khmer Phone Number Support
-Created by Kimi K2.5
+Created by Chan Makara
 """
 
 from __future__ import annotations

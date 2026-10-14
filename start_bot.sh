@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # AI STAND WY2.5 - Startup Script for Linux/macOS
-# Created by Kimi K2.5
+# Created by Chan Makara
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                                                              ║"

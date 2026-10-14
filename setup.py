@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AI STAND WY2.5 - Setup Script
-Created by Kimi K2.5
+Created by Chan Makara
 """
 
 import os

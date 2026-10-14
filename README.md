@@ -15,7 +15,7 @@
 ## ✨ Features
 
 - **🧠 Natural Language Processing** - Chat naturally with intelligent routing
-- **⚡ 400+ Commands** - Full integration with Claude Code architecture
+- **⚡ 400+ Commands** - Modular command & tool routing
 - **🔧 300+ Tools** - Extensive tool library for various operations
 - **💬 Session Management** - Persistent conversation history
 - **🎯 Smart Routing** - Automatic command/tool matching
@@ -136,7 +136,7 @@ start_bot.bat
 
 ## 🏗️ Architecture
 
-This bot is built on the **Claude Code Python Port** architecture:
+Architecture overview:
 
 ```
 ai_stand_wy25_bot/
@@ -253,7 +253,7 @@ This project is based on the Claude Code Python Port.
 
 ## 🙏 Credits
 
-- **Created by:** Kimi K2.5
+- **Created by:** Chan Makara
 - **Architecture:** Claude Code Python Port
 - **Framework:** python-telegram-bot
 

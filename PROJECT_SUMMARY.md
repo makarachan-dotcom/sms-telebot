@@ -180,7 +180,7 @@ The bot uses cyberpunk-inspired styling:
 
 ## 🙏 Credits
 
-- **Created by:** Kimi K2.5
+- **Created by:** Chan Makara
 - **Architecture:** Claude Code Python Port
 - **Framework:** python-telegram-bot
 - **Inspired by:** Claude Code by Anthropic

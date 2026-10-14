@@ -15,8 +15,8 @@ class BotConfig:
     # Bot Info
     name: str = "AI STAND WY2.5"
     version: str = "2.5.0"
-    creator: str = "Kimi K2.5"
-    description: str = "Advanced AI Assistant based on Claude Code Architecture"
+    creator: str = "Chan Makara"
+    description: str = "Advanced Telegram assistant bot"
     
     # Telegram
     token: str = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", ""))
