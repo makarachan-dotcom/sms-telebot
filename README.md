@@ -245,8 +245,6 @@ Edit `config/bot_config.py` to customize:
 
 ---
 
-## 📝 License
-
 ## 🙏 Credits
 
 - **Created by:** Chan Makara
