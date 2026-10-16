@@ -247,14 +247,9 @@ Edit `config/bot_config.py` to customize:
 
 ## 📝 License
 
-This project is based on the Claude Code Python Port.
-
----
-
 ## 🙏 Credits
 
 - **Created by:** Chan Makara
-- **Architecture:** Claude Code Python Port
 - **Framework:** python-telegram-bot
 
 ---
